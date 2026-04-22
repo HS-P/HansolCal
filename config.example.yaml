@@ -1,0 +1,35 @@
+# HansolCal 설정 — config.yaml 로 복사해서 수정 (config.yaml은 gitignored)
+#
+# 각 매핑은 Notion DB 하나 ↔ Google Calendar 하나.
+# 여러 개 나열하면 전부 동기화.
+
+mappings:
+  - name: "Main"                     # 로그 식별용 이름
+    notion_database_id: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"  # 32자 hex (하이픈 제거본도 OK)
+    google_calendar_id: "primary"    # "primary" 또는 calendar ID (xxx@group.calendar.google.com)
+
+    # Notion DB의 property 이름들
+    properties:
+      title: "Name"                  # Title property 이름
+      date: "Date"                   # Date property 이름 (start/end 둘 다 이 하나에 저장)
+      description: "Description"     # Rich text property (선택, 없으면 null)
+      location: "Location"           # Rich text property (선택)
+      # 내부용 (반드시 생성 필요) — 자동 생성 원하면 hansolcal bootstrap 실행
+      gcal_event_id: "gcal_event_id"  # Rich text — GCal event ID 저장
+      gcal_updated: "gcal_updated"    # Rich text — 마지막 동기화 시각
+
+    # Notion → GCal 이벤트 타이틀 prefix (선택)
+    # event_title_prefix: "[Notion] "
+
+# 동작 옵션
+options:
+  # 과거 이벤트 범위 (일 단위). 너무 크게 잡으면 매 사이클 부담.
+  past_days: 30
+  # 미래 이벤트 범위 (일 단위).
+  future_days: 365
+  # 충돌 해결: "last_write_wins" | "notion_wins" | "gcal_wins"
+  conflict_resolution: "last_write_wins"
+  # dry-run: true면 실제 변경 안 하고 로그만 찍음
+  dry_run: false
+  # 로그 레벨: DEBUG | INFO | WARNING | ERROR
+  log_level: "INFO"
