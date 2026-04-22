@@ -204,82 +204,110 @@ class SyncEngine:
 
 
     # ═══════════════════════════════════════════════════════════════
-    # Weekly sync (주간 반복 일정 → GCal recurring event)
+    # Weekly sync (주간 템플릿 → 업무 DB에 N주치 인스턴스 row 생성)
     # ═══════════════════════════════════════════════════════════════
     def _sync_weekly(self, mapping: Mapping) -> SyncStats:
         stats = SyncStats()
         dry = self.config.options.dry_run
-        wp = mapping.weekly_properties
+
+        # 대상 업무 DB 매핑 찾기
+        target = _find_target_mapping(self.config, mapping)
+        if target is None:
+            self.log.error(f"  ✗ target events mapping not found for weekly '{mapping.name}'")
+            stats.errors += 1
+            return stats
 
         items = self.notion.list_weekly_events(mapping)
-        self.log.info(f"  fetched weekly: {len(items)}")
+        self.log.info(f"  fetched weekly templates: {len(items)}")
+
+        # 범위 설정: 오늘부터 lookahead_weeks 주 후
+        from datetime import date as _date
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(mapping.timezone)
+        today = datetime.now(tz).date()
+        horizon = today + timedelta(weeks=mapping.weekly_lookahead_weeks)
+
+        # 업무 DB에서 기존 "파생 row" 인덱스 구축 (중복 생성 방지)
+        derived = self.notion.list_derived_rows(target, mapping.target_source_property)
+        # key: (source_weekly_id, instance_date iso) -> page_id
+        existing_set: set[tuple[str, str]] = set()
+        for d in derived:
+            existing_set.add((d["source"], d["date"]))
+
+        _W2IDX = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
 
         for w in items:
             try:
-                # 비활성 or 요일 없음 → 기존 GCal 이벤트 있으면 삭제
                 if not w.active:
-                    if w.gcal_event_id:
-                        if dry:
-                            self.log.info(f"  [DRY] delete recurring (inactive) '{w.title}'")
-                        else:
-                            self.gcal.delete_event(mapping.google_calendar_id, w.gcal_event_id)
-                            self.notion.set_gcal_ref_weekly(w.page_id, wp, "", datetime.now(timezone.utc))
-                            self.log.info(f"  ✓ GCal recurring deleted (inactive): '{w.title}'")
-                        stats.gcal_deleted += 1
+                    continue  # 비활성 템플릿은 skip
+                # 종료일 이후면 skip
+                if w.end_date and w.end_date.date() < today:
                     continue
 
-                # RRULE 및 start/end datetime 구성
-                rrule = _build_rrule(w.weekdays, w.end_date, mapping.timezone)
-                start_dt, end_dt = _weekly_first_occurrence(w.weekdays, w.start_time, w.end_time)
+                # 해당 주간 row가 발생할 모든 날짜 (today ~ horizon)
+                wd_indices = sorted(_W2IDX[wd] for wd in w.weekdays)
+                for single_day in _iter_days(today, horizon):
+                    if single_day.weekday() not in wd_indices:
+                        continue
+                    if w.end_date and single_day > w.end_date.date():
+                        continue
 
-                # 기존 GCal 이벤트 존재 여부
-                existing: GCalEvent | None = None
-                if w.gcal_event_id:
-                    existing = self.gcal.get_event(mapping.google_calendar_id, w.gcal_event_id)
+                    key = (w.page_id, single_day.isoformat())
+                    if key in existing_set:
+                        continue  # 이미 생성됨
 
-                if existing is None:
-                    # 새로 생성
                     if dry:
-                        self.log.info(f"  [DRY] create recurring '{w.title}' {rrule} start={start_dt.isoformat()}")
-                    else:
-                        new_ev = self.gcal.create_recurring_event(
-                            calendar_id=mapping.google_calendar_id,
-                            title=mapping.event_title_prefix + w.title,
-                            start_dt=start_dt, end_dt=end_dt,
-                            timezone_name=mapping.timezone, rrule=rrule,
-                            description="", location="",
-                            notion_page_id=w.page_id, color_id=w.gcal_color_id,
+                        self.log.info(
+                            f"  [DRY] create task row: '{w.title}' {single_day} "
+                            f"{w.start_time}-{w.end_time} [{w.status_name}]"
                         )
-                        self.notion.set_gcal_ref_weekly(w.page_id, wp, new_ev.event_id, datetime.now(timezone.utc))
-                        self.log.info(f"  ✓ GCal recurring created: '{w.title}' [{rrule}]")
-                    stats.notion_to_gcal_created += 1
-                else:
-                    # 업데이트 (RRULE, 시간, 제목, 색상 등 변경 감지)
-                    if _weekly_needs_update(existing, w, mapping, rrule, start_dt, end_dt):
-                        if dry:
-                            self.log.info(f"  [DRY] update recurring '{w.title}'")
-                        else:
-                            self.gcal.update_recurring_event(
-                                calendar_id=mapping.google_calendar_id,
-                                event_id=existing.event_id,
-                                title=mapping.event_title_prefix + w.title,
-                                start_dt=start_dt, end_dt=end_dt,
-                                timezone_name=mapping.timezone, rrule=rrule,
-                                description="", location="",
-                                notion_page_id=w.page_id, color_id=w.gcal_color_id,
-                            )
-                            self.notion.set_gcal_ref_weekly(w.page_id, wp, existing.event_id, datetime.now(timezone.utc))
-                            self.log.info(f"  ✓ GCal recurring updated: '{w.title}'")
-                        stats.notion_to_gcal_updated += 1
+                    else:
+                        new_page_id = self.notion.create_task_from_weekly(
+                            target_mapping=target,
+                            source_property=mapping.target_source_property,
+                            source_weekly_id=w.page_id,
+                            title=w.title,
+                            instance_date=single_day,
+                            start_time=w.start_time,
+                            end_time=w.end_time,
+                            status_name=w.status_name,
+                            tz_name=mapping.timezone,
+                        )
+                        self.log.info(
+                            f"  ✓ task row created: '{w.title}' {single_day} (page={new_page_id[:8]})"
+                        )
+                    stats.notion_to_gcal_created += 1  # 재사용 (이름은 좀 부정확하지만 통계용)
             except Exception as e:
-                self.log.error(f"  ✗ weekly sync error '{w.title}': {e}", exc_info=True)
+                self.log.error(f"  ✗ weekly template error '{w.title}': {e}", exc_info=True)
                 stats.errors += 1
 
         self.log.info(
-            f"  weekly stats: create={stats.notion_to_gcal_created} "
-            f"update={stats.notion_to_gcal_updated} deleted={stats.gcal_deleted} errors={stats.errors}"
+            f"  weekly stats: rows_created={stats.notion_to_gcal_created} errors={stats.errors}"
         )
         return stats
+
+
+def _find_target_mapping(config: Config, weekly_mapping: Mapping) -> Mapping | None:
+    """주간 매핑의 대상 events 매핑 찾기."""
+    name = weekly_mapping.target_events_mapping.strip()
+    if name:
+        for m in config.mappings:
+            if m.name == name and m.kind == "events":
+                return m
+    # 기본: 첫 번째 events 매핑
+    for m in config.mappings:
+        if m.kind == "events":
+            return m
+    return None
+
+
+def _iter_days(start_date, end_date):
+    """start ~ end(exclusive) 범위의 모든 date 순회."""
+    from datetime import timedelta
+    d = start_date
+    while d <= end_date:
+        yield d
+        d = d + timedelta(days=1)
 
 
 # ────────────────────────────────────────

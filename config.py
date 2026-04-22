@@ -66,11 +66,16 @@ class Mapping:
     properties: PropertyNames
     color_mapping: ColorMapping = field(default_factory=ColorMapping)
     event_title_prefix: str = ""
-    # "events" = 일반 일정 DB (기존), "weekly" = 주간 반복 DB
+    # "events" = 일반 일정 DB (기존), "weekly" = 주간 반복 DB (업무 DB에 row 자동 생성)
     kind: str = "events"
     weekly_properties: WeeklyPropertyNames = field(default_factory=WeeklyPropertyNames)
-    # 주간 일정 시간대 (RFC3339 timezone name)
     timezone: str = "Asia/Seoul"
+    # weekly 전용: 앞으로 몇 주치 인스턴스를 업무 DB에 미리 생성할지
+    weekly_lookahead_weeks: int = 2
+    # weekly 전용: 인스턴스 row를 넣을 대상 events 매핑 이름
+    target_events_mapping: str = ""
+    # weekly 전용: 업무 DB의 "주간출처" property 이름 (파생 row 식별)
+    target_source_property: str = "주간출처"
 
 
 @dataclass
@@ -145,6 +150,9 @@ def load_config(path: str | Path = "config.yaml") -> Config:
             kind=m.get("kind", "events"),
             weekly_properties=wp,
             timezone=m.get("timezone", "Asia/Seoul"),
+            weekly_lookahead_weeks=int(m.get("weekly_lookahead_weeks", 2)),
+            target_events_mapping=m.get("target_events_mapping", ""),
+            target_source_property=m.get("target_source_property", "주간출처"),
         ))
 
     opts_raw = raw.get("options", {}) or {}

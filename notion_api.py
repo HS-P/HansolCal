@@ -24,10 +24,11 @@ class WeeklyNotionEvent:
     start_time: str              # "10:00"
     end_time: str                # "11:30"
     active: bool
-    end_date: datetime | None    # UNTIL 처리용
+    end_date: datetime | None    # 이 날까지만 반복
     gcal_event_id: str
     last_edited_time: datetime
     gcal_color_id: int = 0
+    status_name: str = ""        # 상태 값 이름 (업무 DB row 생성 시 그대로 복사)
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -198,6 +199,70 @@ class NotionAPI:
             cursor = resp.get("next_cursor")
         return out
 
+    def list_derived_rows(self, target_mapping: Mapping, source_property: str) -> list[dict]:
+        """업무 DB에서 '주간출처' 값이 있는 row들의 (source, date) 목록 반환."""
+        out: list[dict] = []
+        cursor: str | None = None
+        tp = target_mapping.properties
+        while True:
+            resp = self.client.databases.query(
+                database_id=target_mapping.notion_database_id,
+                filter={"property": source_property, "rich_text": {"is_not_empty": True}},
+                start_cursor=cursor, page_size=100,
+            )
+            for page in resp.get("results", []):
+                if page.get("archived"):
+                    continue
+                src = _rich_text(page.get("properties", {}).get(source_property))
+                date_prop = page.get("properties", {}).get(tp.date) or {}
+                date_val = date_prop.get("date") or {}
+                start_raw = date_val.get("start", "")
+                if not src or not start_raw:
+                    continue
+                # 날짜 부분만 뽑음 (YYYY-MM-DD)
+                date_iso = start_raw[:10]
+                out.append({"page_id": page["id"], "source": src.strip(), "date": date_iso})
+            if not resp.get("has_more"):
+                break
+            cursor = resp.get("next_cursor")
+        return out
+
+    def create_task_from_weekly(self, target_mapping: Mapping, source_property: str,
+                                source_weekly_id: str, title: str, instance_date,
+                                start_time: str, end_time: str,
+                                status_name: str, tz_name: str) -> str:
+        """주간 템플릿 기반으로 업무 DB에 단일 row 생성."""
+        import zoneinfo
+        from datetime import time as dtime, datetime as _dt
+        tz = zoneinfo.ZoneInfo(tz_name)
+
+        sh, sm = [int(x) for x in start_time.split(":")]
+        eh, em = [int(x) for x in end_time.split(":")]
+        start_dt = _dt.combine(instance_date, dtime(sh, sm), tzinfo=tz)
+        end_dt = _dt.combine(instance_date, dtime(eh, em), tzinfo=tz)
+        if end_dt <= start_dt:
+            from datetime import timedelta as _td
+            end_dt = start_dt + _td(hours=1)
+
+        tp = target_mapping.properties
+        title_prop_name = self._find_title_property_name(
+            target_mapping.notion_database_id, tp.title
+        )
+
+        properties: dict[str, Any] = {
+            title_prop_name: {"title": [{"type": "text", "text": {"content": title or "(untitled)"}}]},
+            tp.date: {"date": {"start": start_dt.isoformat(), "end": end_dt.isoformat()}},
+            source_property: _text_prop(source_weekly_id),
+        }
+        if status_name:
+            properties["상태"] = {"status": {"name": status_name}}
+
+        page = self.client.pages.create(
+            parent={"database_id": target_mapping.notion_database_id},
+            properties=properties,
+        )
+        return page["id"]
+
     def set_gcal_ref_weekly(self, page_id: str, wp: WeeklyPropertyNames,
                             gcal_event_id: str, synced_at: datetime) -> None:
         self.client.pages.update(
@@ -324,8 +389,15 @@ def _parse_weekly_page(page: dict, wp: WeeklyPropertyNames, cm: ColorMapping) ->
     last_edited = dtparser.isoparse(page["last_edited_time"])
 
     gcal_color_id = 0
+    status_name = ""
     if cm.source_property:
         gcal_color_id = _resolve_color_id(p.get(cm.source_property), cm)
+        st_prop = p.get(cm.source_property) or {}
+        t = st_prop.get("type")
+        if t == "status":
+            status_name = (st_prop.get("status") or {}).get("name", "") or ""
+        elif t == "select":
+            status_name = (st_prop.get("select") or {}).get("name", "") or ""
 
     return WeeklyNotionEvent(
         page_id=page["id"],
@@ -338,6 +410,7 @@ def _parse_weekly_page(page: dict, wp: WeeklyPropertyNames, cm: ColorMapping) ->
         gcal_event_id=gcal_id,
         last_edited_time=last_edited,
         gcal_color_id=gcal_color_id,
+        status_name=status_name,
         raw=page,
     )
 
