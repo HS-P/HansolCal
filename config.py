@@ -46,6 +46,19 @@ class ColorMapping:
 
 
 @dataclass
+class WeeklyPropertyNames:
+    """주간 반복 일정 DB용 property 이름."""
+    title: str = "이름"
+    weekday: str = "요일"             # multi-select (월 화 수 목 금 토 일)
+    start_time: str = "시작 시간"      # rich text "HH:MM"
+    end_time: str = "종료 시간"        # rich text "HH:MM"
+    active: str = "활성"              # checkbox
+    end_date: str | None = "종료일"    # date (optional)
+    gcal_event_id: str = "gcal_event_id"
+    gcal_updated: str = "gcal_updated"
+
+
+@dataclass
 class Mapping:
     name: str
     notion_database_id: str
@@ -53,6 +66,11 @@ class Mapping:
     properties: PropertyNames
     color_mapping: ColorMapping = field(default_factory=ColorMapping)
     event_title_prefix: str = ""
+    # "events" = 일반 일정 DB (기존), "weekly" = 주간 반복 DB
+    kind: str = "events"
+    weekly_properties: WeeklyPropertyNames = field(default_factory=WeeklyPropertyNames)
+    # 주간 일정 시간대 (RFC3339 timezone name)
+    timezone: str = "Asia/Seoul"
 
 
 @dataclass
@@ -105,6 +123,18 @@ def load_config(path: str | Path = "config.yaml") -> Config:
             default_color_id=int(cm_raw.get("default_color_id", 0)),
         )
 
+        wp_raw = m.get("weekly_properties", {}) or {}
+        wp = WeeklyPropertyNames(
+            title=wp_raw.get("title", "이름"),
+            weekday=wp_raw.get("weekday", "요일"),
+            start_time=wp_raw.get("start_time", "시작 시간"),
+            end_time=wp_raw.get("end_time", "종료 시간"),
+            active=wp_raw.get("active", "활성"),
+            end_date=wp_raw.get("end_date") or None,
+            gcal_event_id=wp_raw.get("gcal_event_id", "gcal_event_id"),
+            gcal_updated=wp_raw.get("gcal_updated", "gcal_updated"),
+        )
+
         mappings.append(Mapping(
             name=m["name"],
             notion_database_id=_normalize_id(m["notion_database_id"]),
@@ -112,6 +142,9 @@ def load_config(path: str | Path = "config.yaml") -> Config:
             properties=props,
             color_mapping=cm,
             event_title_prefix=m.get("event_title_prefix", ""),
+            kind=m.get("kind", "events"),
+            weekly_properties=wp,
+            timezone=m.get("timezone", "Asia/Seoul"),
         ))
 
     opts_raw = raw.get("options", {}) or {}

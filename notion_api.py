@@ -12,7 +12,23 @@ from typing import Any
 from dateutil import parser as dtparser
 from notion_client import Client
 
-from config import ColorMapping, Mapping, PropertyNames
+from config import ColorMapping, Mapping, PropertyNames, WeeklyPropertyNames
+
+
+@dataclass
+class WeeklyNotionEvent:
+    """주간 반복 이벤트 (Notion 주간 일정 관리 DB)."""
+    page_id: str
+    title: str
+    weekdays: list[str]          # ["MO", "WE", "FR"] (GCal BYDAY 형식)
+    start_time: str              # "10:00"
+    end_time: str                # "11:30"
+    active: bool
+    end_date: datetime | None    # UNTIL 처리용
+    gcal_event_id: str
+    last_edited_time: datetime
+    gcal_color_id: int = 0
+    raw: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -158,6 +174,40 @@ class NotionAPI:
     def archive_page(self, page_id: str) -> None:
         self.client.pages.update(page_id=page_id, archived=True)
 
+    # ═══════════════════════════════════════════════════════════════
+    # Weekly DB (주간 일정 관리)
+    # ═══════════════════════════════════════════════════════════════
+    def list_weekly_events(self, mapping: Mapping) -> list[WeeklyNotionEvent]:
+        wp = mapping.weekly_properties
+        cm = mapping.color_mapping
+        out: list[WeeklyNotionEvent] = []
+        cursor: str | None = None
+        while True:
+            resp = self.client.databases.query(
+                database_id=mapping.notion_database_id,
+                start_cursor=cursor, page_size=100,
+            )
+            for page in resp.get("results", []):
+                if page.get("archived"):
+                    continue
+                ev = _parse_weekly_page(page, wp, cm)
+                if ev is not None:
+                    out.append(ev)
+            if not resp.get("has_more"):
+                break
+            cursor = resp.get("next_cursor")
+        return out
+
+    def set_gcal_ref_weekly(self, page_id: str, wp: WeeklyPropertyNames,
+                            gcal_event_id: str, synced_at: datetime) -> None:
+        self.client.pages.update(
+            page_id=page_id,
+            properties={
+                wp.gcal_event_id: _text_prop(gcal_event_id),
+                wp.gcal_updated: _text_prop(synced_at.isoformat()),
+            },
+        )
+
     # ────────────────────────────────────────
     def _find_title_property_name(self, database_id: str, fallback: str) -> str:
         """DB 스키마에서 type=title 인 property 이름 탐지 (캐시)."""
@@ -230,6 +280,66 @@ def _to_notion_date(start: datetime, end: datetime | None, all_day: bool) -> dic
     if end is not None:
         out["end"] = _fmt(end)
     return out
+
+
+# Notion 한글 요일 → GCal BYDAY 코드
+_WEEKDAY_MAP = {
+    "월": "MO", "화": "TU", "수": "WE", "목": "TH",
+    "금": "FR", "토": "SA", "일": "SU",
+}
+
+
+def _parse_weekly_page(page: dict, wp: WeeklyPropertyNames, cm: ColorMapping) -> WeeklyNotionEvent | None:
+    p = page.get("properties", {})
+    title = _extract_title(p, wp.title)
+
+    # 요일 multi-select
+    wd_prop = p.get(wp.weekday, {}) or {}
+    wd_options = wd_prop.get("multi_select", []) or []
+    weekdays: list[str] = []
+    for opt in wd_options:
+        name = (opt.get("name") or "").strip()
+        code = _WEEKDAY_MAP.get(name)
+        if code:
+            weekdays.append(code)
+    if not weekdays:
+        return None  # 요일 미선택 → skip
+
+    start_time = _rich_text(p.get(wp.start_time)).strip()
+    end_time = _rich_text(p.get(wp.end_time)).strip()
+    if not start_time or not end_time:
+        return None
+
+    active_prop = p.get(wp.active) or {}
+    active = bool(active_prop.get("checkbox", False))
+
+    end_date: datetime | None = None
+    if wp.end_date:
+        ed_prop = p.get(wp.end_date) or {}
+        ed_val = ed_prop.get("date")
+        if ed_val and ed_val.get("start"):
+            end_date, _ = _parse_date(ed_val["start"])
+
+    gcal_id = _rich_text(p.get(wp.gcal_event_id))
+    last_edited = dtparser.isoparse(page["last_edited_time"])
+
+    gcal_color_id = 0
+    if cm.source_property:
+        gcal_color_id = _resolve_color_id(p.get(cm.source_property), cm)
+
+    return WeeklyNotionEvent(
+        page_id=page["id"],
+        title=title,
+        weekdays=weekdays,
+        start_time=start_time,
+        end_time=end_time,
+        active=active,
+        end_date=end_date,
+        gcal_event_id=gcal_id,
+        last_edited_time=last_edited,
+        gcal_color_id=gcal_color_id,
+        raw=page,
+    )
 
 
 def _resolve_color_id(prop: dict | None, cm: ColorMapping) -> int:

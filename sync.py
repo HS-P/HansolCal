@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 
 from config import Config, Mapping
 from gcal_api import GCalAPI, GCalEvent
-from notion_api import NotionAPI, NotionEvent
+from notion_api import NotionAPI, NotionEvent, WeeklyNotionEvent
 
 
 @dataclass
@@ -46,8 +46,11 @@ class SyncEngine:
     def run(self) -> dict[str, SyncStats]:
         results: dict[str, SyncStats] = {}
         for mapping in self.config.mappings:
-            self.log.info(f"=== Syncing mapping: {mapping.name} ===")
-            results[mapping.name] = self._sync_one(mapping)
+            self.log.info(f"=== Syncing mapping: {mapping.name} (kind={mapping.kind}) ===")
+            if mapping.kind == "weekly":
+                results[mapping.name] = self._sync_weekly(mapping)
+            else:
+                results[mapping.name] = self._sync_one(mapping)
         return results
 
     # ────────────────────────────────────────
@@ -198,6 +201,145 @@ class SyncEngine:
             f"deleted={stats.gcal_deleted} skipped_safety={stats.skipped_safety} errors={stats.errors}"
         )
         return stats
+
+
+    # ═══════════════════════════════════════════════════════════════
+    # Weekly sync (주간 반복 일정 → GCal recurring event)
+    # ═══════════════════════════════════════════════════════════════
+    def _sync_weekly(self, mapping: Mapping) -> SyncStats:
+        stats = SyncStats()
+        dry = self.config.options.dry_run
+        wp = mapping.weekly_properties
+
+        items = self.notion.list_weekly_events(mapping)
+        self.log.info(f"  fetched weekly: {len(items)}")
+
+        for w in items:
+            try:
+                # 비활성 or 요일 없음 → 기존 GCal 이벤트 있으면 삭제
+                if not w.active:
+                    if w.gcal_event_id:
+                        if dry:
+                            self.log.info(f"  [DRY] delete recurring (inactive) '{w.title}'")
+                        else:
+                            self.gcal.delete_event(mapping.google_calendar_id, w.gcal_event_id)
+                            self.notion.set_gcal_ref_weekly(w.page_id, wp, "", datetime.now(timezone.utc))
+                            self.log.info(f"  ✓ GCal recurring deleted (inactive): '{w.title}'")
+                        stats.gcal_deleted += 1
+                    continue
+
+                # RRULE 및 start/end datetime 구성
+                rrule = _build_rrule(w.weekdays, w.end_date, mapping.timezone)
+                start_dt, end_dt = _weekly_first_occurrence(w.weekdays, w.start_time, w.end_time)
+
+                # 기존 GCal 이벤트 존재 여부
+                existing: GCalEvent | None = None
+                if w.gcal_event_id:
+                    existing = self.gcal.get_event(mapping.google_calendar_id, w.gcal_event_id)
+
+                if existing is None:
+                    # 새로 생성
+                    if dry:
+                        self.log.info(f"  [DRY] create recurring '{w.title}' {rrule} start={start_dt.isoformat()}")
+                    else:
+                        new_ev = self.gcal.create_recurring_event(
+                            calendar_id=mapping.google_calendar_id,
+                            title=mapping.event_title_prefix + w.title,
+                            start_dt=start_dt, end_dt=end_dt,
+                            timezone_name=mapping.timezone, rrule=rrule,
+                            description="", location="",
+                            notion_page_id=w.page_id, color_id=w.gcal_color_id,
+                        )
+                        self.notion.set_gcal_ref_weekly(w.page_id, wp, new_ev.event_id, datetime.now(timezone.utc))
+                        self.log.info(f"  ✓ GCal recurring created: '{w.title}' [{rrule}]")
+                    stats.notion_to_gcal_created += 1
+                else:
+                    # 업데이트 (RRULE, 시간, 제목, 색상 등 변경 감지)
+                    if _weekly_needs_update(existing, w, mapping, rrule, start_dt, end_dt):
+                        if dry:
+                            self.log.info(f"  [DRY] update recurring '{w.title}'")
+                        else:
+                            self.gcal.update_recurring_event(
+                                calendar_id=mapping.google_calendar_id,
+                                event_id=existing.event_id,
+                                title=mapping.event_title_prefix + w.title,
+                                start_dt=start_dt, end_dt=end_dt,
+                                timezone_name=mapping.timezone, rrule=rrule,
+                                description="", location="",
+                                notion_page_id=w.page_id, color_id=w.gcal_color_id,
+                            )
+                            self.notion.set_gcal_ref_weekly(w.page_id, wp, existing.event_id, datetime.now(timezone.utc))
+                            self.log.info(f"  ✓ GCal recurring updated: '{w.title}'")
+                        stats.notion_to_gcal_updated += 1
+            except Exception as e:
+                self.log.error(f"  ✗ weekly sync error '{w.title}': {e}", exc_info=True)
+                stats.errors += 1
+
+        self.log.info(
+            f"  weekly stats: create={stats.notion_to_gcal_created} "
+            f"update={stats.notion_to_gcal_updated} deleted={stats.gcal_deleted} errors={stats.errors}"
+        )
+        return stats
+
+
+# ────────────────────────────────────────
+def _build_rrule(weekdays: list[str], end_date: datetime | None, tz_name: str) -> str:
+    rule = f"FREQ=WEEKLY;BYDAY={','.join(weekdays)}"
+    if end_date is not None:
+        # UNTIL은 UTC Z 형식 또는 floating. 날짜의 end-of-day를 UTC로 변환.
+        from datetime import time as dtime
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo(tz_name)
+        local_end = datetime.combine(end_date.date(), dtime(23, 59, 59), tzinfo=tz)
+        utc_end = local_end.astimezone(timezone.utc)
+        rule += f";UNTIL={utc_end.strftime('%Y%m%dT%H%M%SZ')}"
+    return rule
+
+
+def _weekly_first_occurrence(weekdays: list[str], start_hm: str, end_hm: str) -> tuple[datetime, datetime]:
+    """BYDAY 기준 이번 주의 첫 해당 요일 + 시간.
+
+    GCal recurring event는 start가 BYDAY 중 하나여야 제대로 동작.
+    이번 주 월요일 기준, 지정 요일 중 가장 먼저 오는 것으로 설정.
+    """
+    _MAP_IDX = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
+    indices = sorted(_MAP_IDX[w] for w in weekdays)
+    first_idx = indices[0]
+
+    import zoneinfo
+    tz = zoneinfo.ZoneInfo("Asia/Seoul")
+    today = datetime.now(tz).date()
+    monday = today - timedelta(days=today.weekday())  # 이번 주 월요일
+    first_day = monday + timedelta(days=first_idx)
+
+    sh, sm = [int(x) for x in start_hm.split(":")]
+    eh, em = [int(x) for x in end_hm.split(":")]
+    from datetime import time as dtime
+    start_dt = datetime.combine(first_day, dtime(sh, sm), tzinfo=tz)
+    end_dt = datetime.combine(first_day, dtime(eh, em), tzinfo=tz)
+    if end_dt <= start_dt:
+        end_dt = start_dt + timedelta(hours=1)
+    return start_dt, end_dt
+
+
+def _weekly_needs_update(ge: GCalEvent, w: WeeklyNotionEvent, mapping: Mapping,
+                         rrule: str, start_dt: datetime, end_dt: datetime) -> bool:
+    expected_title = mapping.event_title_prefix + w.title
+    if expected_title != ge.title:
+        return True
+    # recurrence rule 비교 (raw에 있음)
+    raw_rec = ge.raw.get("recurrence") or []
+    existing_rrule = next((r.replace("RRULE:", "") for r in raw_rec if r.startswith("RRULE:")), "")
+    if existing_rrule != rrule:
+        return True
+    # 시작 시각(시/분) 비교 - 날짜 자체는 달라도 됨 (매주 같은 요일/시간이면 OK)
+    if ge.start and (ge.start.hour, ge.start.minute) != (start_dt.hour, start_dt.minute):
+        return True
+    if ge.end and (ge.end.hour, ge.end.minute) != (end_dt.hour, end_dt.minute):
+        return True
+    if w.gcal_color_id and w.gcal_color_id != ge.color_id:
+        return True
+    return False
 
 
 # ────────────────────────────────────────

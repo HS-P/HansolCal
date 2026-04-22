@@ -82,6 +82,24 @@ class GCalAPI:
         item = self.service.events().update(calendarId=calendar_id, eventId=event_id, body=body).execute()
         return _parse_event(item)  # type: ignore[return-value]
 
+    def create_recurring_event(self, calendar_id: str, *, title: str, start_dt: datetime,
+                               end_dt: datetime, timezone_name: str, rrule: str,
+                               description: str, location: str, notion_page_id: str,
+                               color_id: int = 0) -> "GCalEvent":
+        body = _to_recurring_body(title, start_dt, end_dt, timezone_name, rrule,
+                                  description, location, notion_page_id, color_id)
+        item = self.service.events().insert(calendarId=calendar_id, body=body).execute()
+        return _parse_event(item)  # type: ignore[return-value]
+
+    def update_recurring_event(self, calendar_id: str, event_id: str, *, title: str,
+                               start_dt: datetime, end_dt: datetime, timezone_name: str,
+                               rrule: str, description: str, location: str,
+                               notion_page_id: str, color_id: int = 0) -> "GCalEvent":
+        body = _to_recurring_body(title, start_dt, end_dt, timezone_name, rrule,
+                                  description, location, notion_page_id, color_id)
+        item = self.service.events().update(calendarId=calendar_id, eventId=event_id, body=body).execute()
+        return _parse_event(item)  # type: ignore[return-value]
+
     def delete_event(self, calendar_id: str, event_id: str) -> None:
         try:
             self.service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
@@ -200,6 +218,29 @@ def _to_gcal_body(title: str, start: datetime, end: datetime | None, all_day: bo
         "summary": title or "(untitled)",
         "start": _time_block(start),
         "end": _time_block(end),
+        "description": description or "",
+        "location": location or "",
+        "extendedProperties": {
+            "private": {EXTPROP_NOTION_PAGE_ID: notion_page_id}
+        },
+    }
+    if color_id and 1 <= color_id <= 11:
+        body["colorId"] = str(color_id)
+    return body
+
+
+def _to_recurring_body(title: str, start_dt: datetime, end_dt: datetime, timezone_name: str,
+                       rrule: str, description: str, location: str, notion_page_id: str,
+                       color_id: int = 0) -> dict:
+    """Recurring event body (timed, with timezone).
+
+    rrule 예: "FREQ=WEEKLY;BYDAY=MO,WE" (RRULE: prefix는 자동 추가).
+    """
+    body: dict[str, Any] = {
+        "summary": title or "(untitled)",
+        "start": {"dateTime": start_dt.isoformat(), "timeZone": timezone_name},
+        "end": {"dateTime": end_dt.isoformat(), "timeZone": timezone_name},
+        "recurrence": [f"RRULE:{rrule}"],
         "description": description or "",
         "location": location or "",
         "extendedProperties": {
