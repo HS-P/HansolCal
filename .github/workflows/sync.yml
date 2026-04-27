@@ -34,4 +34,12 @@ jobs:
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           GOOGLE_TOKEN_JSON: ${{ secrets.GOOGLE_TOKEN_JSON }}
-        run: python main.py
+        run: |
+          for attempt in 1 2 3; do
+            if python main.py; then
+              exit 0
+            fi
+            echo "sync failed; retrying (${attempt}/3) after 60 seconds"
+            sleep 60
+          done
+          exit 1
