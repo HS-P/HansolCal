@@ -72,6 +72,12 @@ class SyncEngine:
         for ev in gcal_events:
             if ev.notion_page_id:
                 gcal_by_notion_id[ev.notion_page_id] = ev
+            elif not _can_delete_gcal_event(ev):
+                stats.skipped_safety += 1
+                self.log.info(
+                    f"  skip unmanaged GCal '{ev.title}' ({ev.event_id}); "
+                    f"event_type={ev.event_type}"
+                )
             else:
                 orphan_gcal.append(ev)
 
@@ -161,6 +167,13 @@ class SyncEngine:
         ]
         for ev in dangling:
             try:
+                if not _can_delete_gcal_event(ev):
+                    stats.skipped_safety += 1
+                    self.log.info(
+                        f"  skip dangling GCal '{ev.title}' ({ev.event_id}); "
+                        f"event_type={ev.event_type}"
+                    )
+                    continue
                 if dry:
                     self.log.info(f"  [DRY] delete dangling GCal '{ev.title}' (Notion page {ev.notion_page_id} missing)")
                 else:
@@ -277,6 +290,10 @@ def _as_utc(d: datetime) -> datetime:
     if d.tzinfo is None:
         return d.replace(tzinfo=timezone.utc)
     return d.astimezone(timezone.utc)
+
+
+def _can_delete_gcal_event(ev: GCalEvent) -> bool:
+    return ev.event_type == "default" and not ev.raw.get("locked", False)
 
 
 def _needs_update_from_notion(ne: NotionEvent, ge: GCalEvent, mapping: Mapping) -> bool:
