@@ -30,6 +30,7 @@ class GCalEvent:
     updated: datetime
     notion_page_id: str
     color_id: int = 0
+    event_type: str = "default"
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -228,6 +229,7 @@ def _parse_event(item: dict) -> GCalEvent | None:
         updated=updated,
         notion_page_id=notion_page_id,
         color_id=color_id,
+        event_type=item.get("eventType") or "default",
         raw=item,
     )
 
