@@ -2,17 +2,27 @@ name: sync
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # 5분마다 (GitHub 부하 시 약간 지연될 수 있음)
-  workflow_dispatch: {}     # 수동 트리거도 허용
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      run_sync:
+        description: "Check this box to run sync manually."
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
 
 concurrency:
   group: hansolcal-sync
-  cancel-in-progress: false  # 이전 실행 끝날 때까지 대기 (중복 방지)
+  cancel-in-progress: true
 
 jobs:
   sync:
+    if: ${{ github.event_name == 'schedule' || inputs.run_sync }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -38,6 +48,9 @@ jobs:
           for attempt in 1 2 3; do
             if python main.py; then
               exit 0
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              break
             fi
             echo "sync failed; retrying (${attempt}/3) after 60 seconds"
             sleep 60
