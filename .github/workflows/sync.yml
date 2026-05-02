@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   sync:
-    if: ${{ github.event_name == 'schedule' || inputs.run_sync }}
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -44,6 +44,7 @@ jobs:
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           GOOGLE_TOKEN_JSON: ${{ secrets.GOOGLE_TOKEN_JSON }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           for attempt in 1 2 3; do
             if python main.py; then
@@ -55,4 +56,16 @@ jobs:
             echo "sync failed; retrying (${attempt}/3) after 60 seconds"
             sleep 60
           done
+
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            echo "::warning::scheduled sync failed after 3 attempts; suppressing failure notification"
+            {
+              echo "### Scheduled sync failed after retries"
+              echo ""
+              echo "The scheduled run was marked successful to avoid GitHub email spam."
+              echo "Run this workflow manually with run_sync=true when you want a failing status for debugging."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
           exit 1
