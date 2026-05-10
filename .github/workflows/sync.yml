@@ -13,6 +13,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 concurrency:
   group: hansolcal-sync
@@ -41,13 +42,18 @@ jobs:
           printf '%s' "$CONFIG_YAML" > config.yaml
 
       - name: Run sync
+        id: sync
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           GOOGLE_TOKEN_JSON: ${{ secrets.GOOGLE_TOKEN_JSON }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
+          set +e
+          LOG=$(mktemp)
           for attempt in 1 2 3; do
-            if python main.py; then
+            python main.py 2>&1 | tee -a "$LOG"
+            rc=${PIPESTATUS[0]}
+            if [ "$rc" -eq 0 ]; then
               exit 0
             fi
             if [ "$attempt" -eq 3 ]; then
@@ -57,8 +63,11 @@ jobs:
             sleep 60
           done
 
+          if grep -qE "invalid_grant|invalid_client|RefreshError|Token has been expired or revoked" "$LOG"; then
+            echo "auth_failure=true" >> "$GITHUB_OUTPUT"
+          fi
+
           if [ "$EVENT_NAME" = "schedule" ]; then
-            echo "::warning::scheduled sync failed after 3 attempts; suppressing failure notification"
             {
               echo "### Scheduled sync failed after retries"
               echo ""
@@ -69,3 +78,27 @@ jobs:
           fi
 
           exit 1
+
+      - name: Open issue on auth failure
+        if: ${{ steps.sync.outputs.auth_failure == 'true' && github.event_name == 'schedule' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="Sync auth failure: Google token needs refresh"
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$TITLE\"" --json number -q 'length')
+          if [ "$existing" = "0" ]; then
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "$TITLE" \
+              --body "Scheduled sync failed with a Google OAuth auth error (invalid_grant / invalid_client / RefreshError).
+
+          **Action required:** regenerate \`google_token.json\` locally and update the \`GOOGLE_TOKEN_JSON\` repo secret.
+
+              cd ~/HansolCal && source .venv/bin/activate && python get_google_token.py
+              gh secret set GOOGLE_TOKEN_JSON --repo \$GITHUB_REPOSITORY < google_token.json
+
+          See run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          Close this issue once sync is healthy again."
+          else
+            echo "Open auth-failure issue already exists; skipping."
+          fi
