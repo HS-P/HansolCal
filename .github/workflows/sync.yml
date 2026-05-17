@@ -21,7 +21,7 @@ concurrency:
 
 jobs:
   sync:
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ github.event_name == 'schedule' || inputs.run_sync }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
